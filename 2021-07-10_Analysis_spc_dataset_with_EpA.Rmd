@@ -175,27 +175,6 @@ As anticipated, we see a greater number of cells with higher cc scores in injure
 Filter out cells with >20% mt genes, and filter out cells with low cc.score (<0.25) in combination with nFeatures >3sd from the mean. 
 NOTE: Will have a look dowstream to make sure we lose the "cells" (prob nuclei) that look unhealthy with very *low* mito scores, too. 
 
-```{r FilterFunc}
-filter_samples <- function(object_name) {
-  # Prep for mito filtering 
-  mito.genes <- grep(pattern = "^mt-", x = rownames(x = GetAssayData(object = object_name)), value = TRUE)
-  counts <- GetAssayData(object = object_name, slot = "counts")
-  percent.mito <- Matrix::colSums(counts[mito.genes,])/Matrix::colSums(counts)
-  
-  object_name <- AddMetaData(object = object_name, metadata = percent.mito, col.name = "percent.mito")
-  
-  # Filter out cells with > 25% mt genes
-  print(paste("Removed", length(which(object_name@meta.data$percent.mito > 0.20)),"cells with mitochondrial content > 20%"))
- # object_name <- subset(object_name, subset = percent.mito > -Inf & percent.mito < 0.20)
-  object_name <- object_name[object_name@meta.data$percent.mito > -Inf & object_name@meta.data$percent.mito < 0.20]
-  
-  return(object_name)
-}
-
-object_name_test <- filter_samples(object_name = seurat_object.troyUI, mito_lim = 0.20, g2m_lim = 0.25, s_lim = 0.25)
-#seurat_object.troyUI2 <- filter_samples(object_name = seurat_object.troyUI, mito_lim = 0.20, g2m_lim = 0.25, s_lim = 0.25)
-```
-
 ```{r FilterObjs}
 samples = list(seurat_object.troyUI, seurat_object.troySCI)
 objects = list()
