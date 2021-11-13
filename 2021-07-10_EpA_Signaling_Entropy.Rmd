@@ -1,0 +1,248 @@
+---
+title: "Troy_Uninj_Inj. BiomaRt LandSCENT."
+author: "Moa Stenudd"
+date: "10/7/2021"
+output: 
+  html_document:
+    theme: "cosmo"
+    highlight: "zenburn"
+---
+
+```{r global_options, include = FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE,
+  tidy = TRUE,
+  cache = TRUE,
+  echo = FALSE
+)
+```
+
+```{r load}
+library(dplyr)
+library(Seurat)
+library(knitr)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(RColorBrewer)
+library(pheatmap)
+library(biomaRt)
+library(LandSCENT)
+library(monocle)
+library(scater)
+```
+
+## Load seurat object
+
+```{r loadSeurat_Featurenames}
+load('Troy_UI_Inj_after_analysis_pipe_TOM_regTom_2021_07_10.Robj')
+
+#genesTroyUI <- read.table('~/Documents/CMB/10X/tom/10X_19_040_tom/outs/filtered_feature_bc_matrix/features.tsv', stringsAsFactors = FALSE)
+
+#genesTroySCI <- read.table('~/Documents/CMB/10X/tom/10X_19_041_tom/outs/filtered_feature_bc_matrix/features.tsv', stringsAsFactors = FALSE)
+
+# check if the two gene tables above are identical
+#identical(genesTroyUI, genesTroySCI)
+
+# They are, so I comment them out and make only one called "genes"
+
+#genes <- read.table('~/Documents/CMB/10X/tom/10X_19_040_tom/outs/filtered_feature_bc_matrix/features.tsv', stringsAsFactors = FALSE)
+
+```
+
+```{r extractMatrix}
+# Extract scaled data from seurat object
+epc.scaled <- GetAssayData(object = epc.combined, slot = "scale.data")
+
+# Extract normalised data from seurat object
+epc.normalized <- as.matrix(GetAssayData(object = epc.combined, slot = "data"))
+
+# Get the cell embeddings 
+epc.embeddings <- Embeddings(object = epc.combined, reduction = "umap")
+epc.clusters <- FetchData(object = epc.combined, vars = "seurat_clusters")
+epc.line <- FetchData(object = epc.combined, vars = "line")
+
+#Make column out of gene names (this is where you'll join the data to the annotation file)
+epc.normalized <- as.data.frame(epc.normalized)
+epc.normalized$MGI.symbol <- rownames(epc.normalized)
+musList <- epc.normalized$MGI.symbol
+```
+
+# Changing from mouse to human gene annotation
+
+## This seems to have generated some duplicates / some missed genes, I need to check if it is a  problem of certain genes only existing in 1 version in the human data  set while they exist in i e 5 in the mouse data set or vice versa - or if it is a problem with biomaRt. For now I will just remove duplicates so that I can try out the downstream processing, but they need to be handled better!
+
+```{r biomaRt}
+convertMouseGenes <- function(x){
+require("biomaRt")
+human <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+mouse <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+
+genesV2 <- getLDS(attributes = "mgi_symbol",
+filters = "mgi_symbol",
+values = x,
+mart = mouse,
+attributesL = "hgnc_symbol",
+martL = human,
+uniqueRows = TRUE)
+
+return(genesV2)
+}
+
+annotation <- convertMouseGenes(musList)
+```
+
+# Join annotation with expression matrix
+
+```{r joinClean}
+# Join annotation and expression matrix by the mouse gene symbol
+epc.normalized.annotated <- left_join(epc.normalized, annotation, by = "MGI.symbol")
+
+# Remove rows (genes) that do not have an annotation in the HGNC column (human gene)
+epc.normalized.annotated <- epc.normalized.annotated[!(is.na(epc.normalized.annotated$HGNC.symbol) | epc.normalized.annotated$HGNC.symbol==""), ]
+```
+
+# Check gene symbols
+
+!!! Some duplicates found !!! Will be handled by deletion of duplicate entries.
+
+```{r names}
+move_to_start <- function(x, n) {
+  x[, c(tail(seq_len(ncol(x)), n), seq_len(ncol(x) - n))]
+} 
+
+epc.normalized.annotated <- move_to_start(epc.normalized.annotated, 2)
+
+# Check for duplicates, subset out any duplicates to a separate DF to check them easily
+epc.anno.duplicates <- subset(epc.normalized.annotated, duplicated(epc.normalized.annotated$HGNC.symbol))
+```
+
+# Remove duplicates + set row names and remove gene name cols
+
+```{r fixRownames}
+#  Removing duplicates
+
+# df = df[order(df[,'Date'],-df[,'Depth']),] <- sort based on something that you wanna keep by, so if you want to keep the one with the highest avg expression you make a col to calc avg expression and then sort by that col, and then remove with the row below
+
+epc.normalized.annotated <- epc.normalized.annotated[!duplicated(epc.normalized.annotated$HGNC.symbol),]
+
+# Make human gene names into row names
+row.names(epc.normalized.annotated) <- epc.normalized.annotated$HGNC.symbol
+
+# Remove gene name columns
+epc.normalized.annotated <- subset(epc.normalized.annotated, select = -c(MGI.symbol, HGNC.symbol))
+```
+
+# Change row names to entrezID
+
+```{r entrez}
+require(AnnotationDbi)
+require(org.Hs.eg.db)
+
+anno.v <- mapIds(org.Hs.eg.db, keys = rownames(epc.normalized.annotated), keytype = "SYMBOL", 
+                 column = "ENTREZID", multiVals = "first")
+unique_anno.v <- unique(anno.v)
+epc.normalized.annotated_New <- matrix(0, nrow = length(unique_anno.v), ncol = dim(epc.normalized.annotated)[2])
+
+for (i in seq_len(length(unique_anno.v))) {
+  tmp <- epc.normalized.annotated[which(anno.v == unique_anno.v[i]) ,]
+  if (!is.null(dim(tmp))) {
+    tmp <- colSums(tmp) / dim(tmp)[1]
+  }
+  epc.normalized.annotated_New[i ,] <- epc.normalized.annotated_New[i ,] + tmp
+}
+rownames(epc.normalized.annotated_New) <- unique_anno.v
+colnames(epc.normalized.annotated_New) <- colnames(epc.normalized.annotated)
+epc.normalized.annotated_New <- epc.normalized.annotated_New[-which(rownames(epc.normalized.annotated_New) %in% NA) ,]
+epc.normalized.annotated <- epc.normalized.annotated_New
+```
+
+# Create single cell experiment
+
+```{r singleCellExperiment}
+library(SingleCellExperiment)
+
+sce <- SingleCellExperiment(list(counts = epc.normalized.annotated),
+   metadata=pData)
+```
+
+# Load PPI 
+```{r PPI}
+# Loading newer PPI from LandSCENT
+data(net17Jan16.m)
+```
+
+```{r landSCENT}
+Integration.l <- DoIntegPPI(exp.m = sce, ppiA.m = net17Jan16.m)
+str(Integration.l)
+ 
+SR.o <- CompSRana(Integration.l, local = TRUE, mc.cores = 8)
+```
+
+```{r SRplot, eval = False}
+boxplot(SR.o$SR ~ SR.o$data.sce@metadata$line)
+
+boxplot(SR.o$SR ~ SR.o$data.sce@metadata$seurat_clusters)
+```
+
+```{r combinePlotMetadata}
+# SR from sce
+SR_df <- as.data.frame(colData(SR.o$data.sce))
+# Cluster assignments from seurat object
+clusters_df <- as.data.frame(epc.combined$seurat_clusters)
+# Line (condition) from seurat object
+line_df <- as.data.frame(epc.combined$line)
+# Umap coordinates from seurat object
+umap_df <- as.data.frame(Embeddings(epc.combined[["umap"]]))
+
+# Join into one df based on rowname
+l <- list(SR_df, line_df, clusters_df, umap_df)
+dfs2 <- Reduce(merge, lapply(l, function(x) data.frame(x, rn = row.names(x))))
+
+save(dfs2, file = "SR_Troy_210710.robj")
+```
+
+```{r plot, fig.height = 3, fig.width = 3.5}
+theme_set(theme_cowplot())
+
+# Plot (identical to above just to check again that the data is good)
+#boxplot(dfs$SR ~ dfs2$epc.combined.seurat_clusters)
+
+ggplot(dfs2, aes(x = epc.combined.seurat_clusters, y = SR, col = epc.combined.line)) + geom_jitter() + xlab("Cluster") + scale_color_brewer("Condition", palette = "Dark2")
+ggplot(dfs2, aes(x = epc.combined.seurat_clusters, y = SR)) + geom_boxplot() 
+ggplot(dfs2, aes(x = epc.combined.line, y = SR)) + geom_boxplot() 
+
+ggplot(dfs2, aes(x = UMAP_1, y = UMAP_2, col = epc.combined.seurat_clusters)) + geom_point() + scale_color_brewer("Cluster", palette = "Dark2")
+ggplot(dfs2, aes(x = UMAP_1, y = UMAP_2, col = SR)) + geom_point() + scale_colour_gradientn(colours = c("lightgray", "yellow", "red"))
+
+```
+
+```{r violins, fig.height=3, fig.width=2.3}
+median.stat <- function(x){
+    out <- quantile(x, probs = c(0.5))
+    names(out) <- c("ymed")
+    return(out) 
+}
+
+ggplot(dfs2, 
+       aes(x = epc.combined.seurat_clusters, 
+           y = SR, 
+           fill = epc.combined.seurat_clusters)) + 
+  geom_violin(scale="width") + 
+  xlab("Cluster") + 
+  scale_fill_brewer(palette = "Dark2") +
+  theme(legend.title=element_blank()) +
+  stat_summary(fun = median.stat, geom = 'point', size = 3, colour = "black")
+
+```
+
+```{r loadSCE, eval = FALSE}
+# Example from tutorial, not used
+sce <- SingleCellExperiment(list(counts=counts),
+    colData = DataFrame(label=pretend.cell.labels),
+    rowData = DataFrame(length=pretend.gene.lengths),
+    metadata = list(study="GSE111111")
+)
+```
+

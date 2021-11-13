@@ -1,0 +1,1865 @@
+---
+title: "Troy_Uninj_Inj. Strict filtering, tom removed for monocle AND for VarGenes in EpC/progeny clustering. RES = 0.2."
+author: "Moa Stenudd & Enric Llorens"
+date: "15/07/2020 & 2021-05-30"
+output: 
+  html_document:
+    theme: "cosmo"
+    highlight: "zenburn"
+---
+
+
+```{r global_options, include = FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE,
+  tidy = TRUE,
+  cache = TRUE,
+  echo = FALSE
+)
+```
+
+```{r load}
+library(dplyr)
+library(Seurat)
+library(cowplot)
+library(knitr)
+library(stringr)
+library(clustree)
+library(ggplot2)
+library(ggridges)
+library(monocle) # = monocle2
+library(ggpubr)
+library(patchwork)
+library(RColorBrewer)
+library(pheatmap)
+library(GO.db)
+library(biomaRt)
+library(tidyverse)
+library(rstatix)
+library(dunn.test)
+library(xlsx)
+library(readxl)
+library(SeuratWrappers)
+library(magrittr)
+
+expression_matrix.troyUI <- Read10X(data.dir = '~/Documents/CMB/10X/tom/10X_19_040_tom/outs/filtered_feature_bc_matrix/')#, strip.suffix = TRUE)
+expression_matrix.troySCI <- Read10X(data.dir = '~/Documents/CMB/10X/tom/10X_19_041_tom/outs/filtered_feature_bc_matrix/')#, strip.suffix = TRUE)
+```
+
+# Load seurats
+Min 3 cells per gene, min 500 features per cell.
+
+```{r seuratObjects}
+
+# Loading uninjured
+
+seurat_object.troyUI = CreateSeuratObject(
+  counts = expression_matrix.troyUI,
+  project = "troy-ui",
+  min.cells = 3,
+  min.features = 500
+)
+seurat_object.troyUI<- NormalizeData(object = seurat_object.troyUI)
+seurat_object.troyUI <- FindVariableFeatures(seurat_object.troyUI, selection.method = "vst")
+seurat_object.troyUI <- ScaleData(seurat_object.troyUI, features = rownames(seurat_object.troyUI))
+
+seurat_object.troySCI = CreateSeuratObject(
+  counts = expression_matrix.troySCI,
+  project = "troy-sci",
+  min.cells = 3,
+  min.features = 500
+)
+
+# Loading injured
+
+seurat_object.troySCI<- NormalizeData(object = seurat_object.troySCI)
+seurat_object.troySCI <- FindVariableFeatures(seurat_object.troySCI, selection.method = "vst")
+seurat_object.troySCI <- ScaleData(seurat_object.troySCI, features = rownames(seurat_object.troySCI))
+
+seurat_object.troyUI$line <- "Troy_UI"
+seurat_object.troySCI$line <- "Troy_SCI"
+
+seurat_object.troyUI$cond <- "UI"
+seurat_object.troySCI$cond <- "SCI"
+
+spc.QC <-
+  merge(
+    x = seurat_object.troyUI,
+    y = seurat_object.troySCI,
+    add.cell.ids = c("Troy_UI", "Troy_SCI"),
+    project = "spc"
+  )
+
+seurat_object.troyUI
+seurat_object.troySCI
+```
+
+# QC metrics prior to filtering
+
+```{r plotQC1, fig.width = 1.5, fig.height = 6}
+spc.QC[["percent.mt"]] <-
+  PercentageFeatureSet(spc.QC, pattern = "^mt-")
+
+line_levels <- c("troy-ui", "troy-sci")
+spc.QC@active.ident <- factor(x = spc.QC@active.ident, levels = line_levels)
+
+a <- VlnPlot(
+  spc.QC,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+  ncol = 3,
+  pt.size = 0,
+  combine = FALSE
+)
+
+for (i in 1:length(a)) {
+  a[[i]] <- a[[i]] + 
+    geom_violin(trim = FALSE, scale = "width") + 
+    NoLegend() + 
+    theme(axis.ticks.x = element_blank(), axis.title = element_blank())
+}
+
+a <- wrap_plots(a, ncol = 1)
+a
+```
+
+```{r plotQC2}
+plot1 <-
+  FeatureScatter(spc.QC, feature1 = "nCount_RNA", feature2 = "percent.mt", pt.size = 0.2) + NoLegend()
+plot2 <-
+  FeatureScatter(spc.QC, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", pt.size = 0.2)
+wrap_plots(list(plot1, plot2))
+```
+
+Looks like we have some cells that have really low mitochondrial gene exp., and these also have really low gene counts -- likely they are just nuclei. We'd like to filter them out also, and will see if they go with the gene/feature cutoffs once they are done.
+
+# Cell cycle scores
+Assign cell cycle scores to use for filtering and later to regress out the diff between G2M and S phase scores
+
+```{r CCScores}
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+s.genes <- str_to_title(s.genes)
+g2m.genes <- str_to_title(g2m.genes)
+
+s.genesTU <- s.genes[s.genes %in% rownames(seurat_object.troyUI)]
+g2m.genesTU <- g2m.genes[g2m.genes %in% rownames(seurat_object.troyUI)]
+seurat_object.troyUI <- CellCycleScoring(seurat_object.troyUI, s.features = s.genesTU, g2m.features = g2m.genesTU, set.ident = F)
+
+s.genesTS <- s.genes[s.genes %in% rownames(seurat_object.troySCI)]
+g2m.genesTS <- g2m.genes[g2m.genes %in% rownames(seurat_object.troySCI)]
+seurat_object.troySCI <- CellCycleScoring(seurat_object.troySCI, s.features = s.genesTS, g2m.features = g2m.genesTS, set.ident = F)
+
+# view cell cycle scores and phase assignments
+head(seurat_object.troyUI[[]])
+head(seurat_object.troySCI[[]])
+```
+
+# Vlnplot of CC scores
+
+```{r ccVlnEarly}
+tu_2 <- VlnPlot(seurat_object.troyUI, features = "G2M.Score", pt.size = 0.1) + NoLegend() + coord_cartesian(ylim = 0:1)
+tu_s <- VlnPlot(seurat_object.troyUI, features = "S.Score", pt.size = 0.1) + NoLegend() + coord_cartesian(ylim = 0:1)
+
+ts_2 <- VlnPlot(seurat_object.troySCI, features = "G2M.Score", pt.size = 0.1) + NoLegend() + coord_cartesian(ylim = 0:1)
+ts_s <- VlnPlot(seurat_object.troySCI, features = "S.Score", pt.size = 0.1) + NoLegend() + coord_cartesian(ylim = 0:1)
+
+a <- wrap_plots(list(tu_2, ts_2))
+b <- wrap_plots(list(tu_s, ts_s))
+wrap_plots(list(a,b))
+```
+
+As anticipated, we see a greater number of cells with higher cc scores in injured cords. 
+
+# Filtering 
+Filter out cells with >20% mt genes, and filter out cells with low cc.score (<0.25) in combination with nFeatures >3sd from the mean. 
+NOTE: Will have a look dowstream to make sure we lose the "cells" (prob nuclei) that look unhealthy with very *low* mito scores, too. 
+
+```{r FilterFunc}
+filter_samples <- function(object_name) {
+  # Prep for mito filtering 
+  mito.genes <- grep(pattern = "^mt-", x = rownames(x = GetAssayData(object = object_name)), value = TRUE)
+  counts <- GetAssayData(object = object_name, slot = "counts")
+  percent.mito <- Matrix::colSums(counts[mito.genes,])/Matrix::colSums(counts)
+  
+  object_name <- AddMetaData(object = object_name, metadata = percent.mito, col.name = "percent.mito")
+  
+  # Filter out cells with > 25% mt genes
+  print(paste("Removed", length(which(object_name@meta.data$percent.mito > 0.20)),"cells with mitochondrial content > 20%"))
+ # object_name <- subset(object_name, subset = percent.mito > -Inf & percent.mito < 0.20)
+  object_name <- object_name[object_name@meta.data$percent.mito > -Inf & object_name@meta.data$percent.mito < 0.20]
+  
+  return(object_name)
+}
+
+object_name_test <- filter_samples(object_name = seurat_object.troyUI, mito_lim = 0.20, g2m_lim = 0.25, s_lim = 0.25)
+#seurat_object.troyUI2 <- filter_samples(object_name = seurat_object.troyUI, mito_lim = 0.20, g2m_lim = 0.25, s_lim = 0.25)
+```
+
+```{r FilterObjs}
+samples = list(seurat_object.troyUI, seurat_object.troySCI)
+objects = list()
+
+for (s in samples) {
+  # Prep for mito filtering 
+  mito.genes <- grep(pattern = "^mt-", x = rownames(x = GetAssayData(object = s)), value = TRUE)
+
+  counts <- GetAssayData(object = s, slot = "counts")
+  percent.mito <- Matrix::colSums(counts[mito.genes,])/Matrix::colSums(counts)
+
+  s <- AddMetaData(object = s, metadata = percent.mito, col.name = "percent.mito")
+
+  # Filter out cells with > 25% mt genes
+  print(paste("Removed", length(which(s@meta.data$percent.mito > 0.2)),"cells with mitochondrial content > 20%"))
+  s <- subset(s, subset = percent.mito > -Inf & percent.mito < 0.2)
+
+  # Filter cells with low cc.score (<0.2) nFeature_RNA >3sd from the mean.
+  outlier_nFeature <- 3 * sd(s@meta.data$nFeature_RNA) + mean(s@meta.data$nFeature_RNA)
+  print(paste("Removed", length(which(s@meta.data$nFeature_RNA > outlier_nFeature & 
+                                             (s@meta.data$G2M.Score < 0.25 & 
+                                              s@meta.data$S.Score < 0.25))), "cells with low cc score (<0.25) and nFeature_RNA > mean+3SD"))
+
+  s <- subset(s, subset = nFeature_RNA > outlier_nFeature & (G2M.Score < 0.25 & S.Score < 0.25), invert = TRUE)  
+  
+  print(VlnPlot(s, c("nFeature_RNA", "nCount_RNA", "percent.mito"), pt.size = 0.2))
+  print(head(s))
+  objects = append(objects, s)
+}
+
+objects[1]
+```
+
+# Combine seurat objects 
+
+```{r combineSeurats}
+
+spc.combined <-
+  merge(
+    x = objects[[1]],
+    y = objects[[2]],
+    add.cell.ids = c("Troy_UI", "Troy_SCI"),
+    project = "spc"
+  )
+
+spc.combined
+```
+
+```{r plotQC3}
+spc.combined[["percent.mt"]] <- PercentageFeatureSet(spc.QC, pattern = "^mt-")
+spc.combined[["percent.ribo"]] <- PercentageFeatureSet(spc.combined, pattern = "^Rp[sl]")
+
+FeatureScatter(object = spc.combined, feature1 = "percent.ribo", feature2 = "percent.mt")
+```
+
+Looks like we have some cells that have really low mitochondrial gene expression, and these also have very low gene counts -- likely they are just nuclei. We'd like to filter them out also. 
+
+```{r filterMito}
+spc.combined <- subset(spc.combined, subset = percent.mito > 0.01)
+
+FeatureScatter(object = spc.combined, feature1 = "percent.ribo", feature2 = "percent.mt")
+```
+
+# Find variable features & scale
+Selecting 3000 highly variable features. Regressing out variation from cc. We don't want cell cycle genes to control our clustering in an injury situation - many rather diff populations may divide after injury. We want to focus on cell-type specific gene expression differences. 
+
+```{r variableFeatures, warning=FALSE, error=FALSE}
+# Find variable features
+spc.combined <-
+  FindVariableFeatures(spc.combined,
+                       selection.method = "vst",
+                       nfeatures = 3000)
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(spc.combined), 10)
+
+# Plot variable features
+plot1 <- VariableFeaturePlot(spc.combined, pt.size = 0.4)
+plot2 <- LabelPoints(plot1, points = top10, repel = TRUE)
+plot2
+
+# Scaling
+all.genes <- rownames(spc.combined)
+spc.combined <- ScaleData(spc.combined, vars.to.regress = c("S.Score", "G2M.Score"), features = rownames(spc.combined))
+```
+
+# PCA & UMAP for clustering cell types
+
+```{r pca}
+spc.combined <-
+  RunPCA(spc.combined, features = VariableFeatures(object = spc.combined))
+
+DimPlot(spc.combined, reduction = "pca", group.by = "line", pt.size = 0.2)
+```
+
+```{r dimensionality, fig.width = 10, fig.height = 4}
+# JackStraw plot / Macosko et al.
+spc.combined <- JackStraw(spc.combined, num.replicate = 100)
+spc.combined <- ScoreJackStraw(spc.combined, dims = 1:20)
+jackstraw <- JackStrawPlot(spc.combined, dims = 1:20)
+# ElbowPlot
+elbow <- ElbowPlot(spc.combined, ndims = 30)
+
+wrap_plots(list(jackstraw, elbow))
+```
+
+# Clustering with UMAP
+Checking a range of resolutions with ClusTree
+
+```{r umap, fig.width = 14, fig.height = 5, message = FALSE, results = 'hide'}
+res.range = seq(from = 0, to = 1, by = 0.1)
+
+spc.combined <- FindNeighbors(spc.combined, dims = 1:30)
+spc.combined <- FindClusters(spc.combined, resolution = res.range)
+
+head(Idents(spc.combined), 10)
+
+# UMAP
+spc.combined <- RunUMAP(spc.combined, dims = 1:30, seed.use = 42)
+
+plot1 <- DimPlot(spc.combined, reduction = "umap", group.by = "RNA_snn_res.0.5", label = TRUE, pt.size = 0.6)
+plot2 <- DimPlot(spc.combined, reduction = "umap", group.by = "line", pt.size = 0.6)
+wrap_plots(list(plot1, plot2))  
+
+DimPlot(
+  spc.combined,
+  reduction = "umap",
+  split.by = "line",
+  label = TRUE,
+  pt.size = 1.0
+) 
+```
+
+
+# ClusTree
+Will use a res of 0.2 based on the ClusTree map.
+
+```{r clusTreeAll, message = FALSE, fig.width = 8.5, fig.height = 3.5}
+clustree(spc.combined)
+
+# Based on the cluster map, we decide to use a res of 0.2
+spc.combined <- FindClusters(spc.combined, resolution = 0.2)
+
+# Plots
+line_levels <- c("Troy_UI", "Troy_SCI")
+spc.combined$line <- factor(x = spc.combined$line, levels = line_levels)
+
+plot1 <- DimPlot(
+  spc.combined,
+  reduction = "umap",
+  label = TRUE,
+  pt.size = 0.6
+)
+plot1 <- plot1 + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), axis.line = element_blank()) 
+
+plot2 <- 
+  DimPlot(spc.combined, 
+          reduction = "umap", 
+          group.by = "line", 
+          pt.size = 0.6) 
+plot2 <- plot2 + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), axis.line = element_blank()) 
+
+wrap_plots(list(plot1, plot2))
+```
+
+# QC clusters
+Check mito, gene counts, UMIs..
+
+```{r QCClus, fig.height = 3, fig.width = 12}
+a <- VlnPlot(
+  spc.combined,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), 
+  group.by = "seurat_clusters",
+  combine = FALSE,
+  pt.size = 0.2
+) 
+wrap_plots(a, ncol = 3)
+```
+
+# Find markers for cell types / clusters
+Identifying additional marker genes for clusters and cluster gangs. Useful for handling doublets.
+
+```{r cellIDMarkers}
+
+# EpC cluster markers
+ClusterEpC.markers <- FindMarkers(spc.combined, ident.1 = c(0, 1, 2), group.by = "seurat_clusters", only.pos = TRUE)
+
+# Subset to create list of markers expressed in most EpC cluster but very few non EpC cluster cells.
+ClusterEpC.markers.pval <- subset(ClusterEpC.markers, subset = (p_val_adj < 0.05 & pct.1 > 0.8 & pct.2 < 0.1))
+print("EP markers:")
+print(ClusterEpC.markers.pval)
+
+# EpC subcluster markers
+ClusterEP1.markers <- FindMarkers(spc.combined, ident.1 = c(0), group.by = "seurat_clusters", only.pos = TRUE)
+ClusterEP2.markers <- FindMarkers(spc.combined, ident.1 = c(1), group.by = "seurat_clusters", only.pos = TRUE)
+ClusterEP3.markers <- FindMarkers(spc.combined, ident.1 = c(2), group.by = "seurat_clusters", only.pos = TRUE)
+
+# Subset to create list of pos markers with p>0.05.
+ClusterEP1.markers.pval <- subset(ClusterEP1.markers, subset = (p_val_adj < 0.05))
+print("EP1 markers:")
+print(ClusterEP1.markers.pval)
+
+ClusterEP2.markers.pval <- subset(ClusterEP2.markers, subset = (p_val_adj < 0.05))
+print("EP2 markers:")
+print(ClusterEP2.markers.pval)
+
+ClusterEP3.markers.pval <- subset(ClusterEP3.markers, subset = (p_val_adj < 0.05))
+print("EP3 markers:")
+print(ClusterEP3.markers.pval)
+
+# Cluster 3 markings (EC)
+clus3.markers <- FindMarkers(spc.combined, ident.1 = 3, group.by = "seurat_clusters", only.pos = TRUE)
+
+#  Subset to create list of markers expressed in most cluster 3
+clus3.markers.pval <- subset(clus3.markers, subset = (p_val_adj < 0.05 & pct.1 > 0.7 & pct.2 < 0.05))
+print("Cluster 3 markers (EC):")
+print(clus3.markers.pval)
+
+# Cluster 4 markings (Fib/Peri)
+clus4.markers <- FindMarkers(spc.combined, ident.1 = 4, group.by = "seurat_clusters", only.pos = TRUE)
+
+#  Subset to create list of markers expressed in most cluster 3
+clus4.markers.pval <- subset(clus4.markers, subset = (p_val_adj < 0.05 & pct.1 > 0.7 & pct.2 < 0.05))
+print("Cluster 4 markers (MG):")
+print(clus4.markers.pval)
+
+# Cluster 5 markings (MG)
+clus5.markers <- FindMarkers(spc.combined, ident.1 = 5, group.by = "seurat_clusters", only.pos = TRUE)
+
+#  Subset to create list of markers expressed in most cluster 3
+clus5.markers.pval <- subset(clus5.markers, subset = (p_val_adj < 0.05 & pct.1 > 0.7 & pct.2 < 0.05))
+print("Cluster 5 markers (Peri/fib):")
+print(clus5.markers.pval)
+
+# Cluster 6 markings (AS)
+clus6.markers <- FindMarkers(spc.combined, ident.1 = 6, group.by = "seurat_clusters", only.pos = TRUE)
+
+#  Subset to create list of markers expressed in most cluster 3
+clus6.markers.pval <- subset(clus6.markers, subset = (p_val_adj < 0.05 & pct.1 > 0.7 & pct.2 < 0.05))
+print("Cluster 6 markers (AS):")
+print(clus6.markers.pval)
+
+# Cluster 7 markings (Imm)
+clus7.markers <- FindMarkers(spc.combined, ident.1 = 7, group.by = "seurat_clusters", only.pos = TRUE)
+
+#  Subset to create list of markers expressed in most cluster 3
+clus7.markers.pval <- subset(clus7.markers, subset = (p_val_adj < 0.05 & pct.1 > 0.7 & pct.2 < 0.05))
+print("Cluster 7 markers (Imm):")
+print(clus7.markers.pval)
+```
+
+# Naming clusters
+
+```{r nameClusters, fig.width = 10, fig.height = 5}
+new.cluster.id <-
+  c(
+    "EP 1", #0 
+    "EP 2", #1
+    "EP 3", #2
+    "EC", #3 - Endothelial cell
+    "MG", #4 - Microglia
+    "Fib/peri", #5 Fibrotic / pericytes
+    "AS", # 6 - low features, high mito, lower tomato -- all sorts of genes expressed together
+    "Imm" # 9 Immune cells
+  )
+
+names(new.cluster.id) <- levels(spc.combined)
+spc.combined <- RenameIdents(spc.combined, new.cluster.id)
+
+# Just checking those names
+DimPlot(spc.combined, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+```
+
+```{r CheckClus_all}
+table(Idents(spc.combined))#, spc.combined$line)
+```
+
+# tdTomato expression + qual plots
+
+```{r vlnPlotTom, fig.width = 6, fig.height = 4.5}
+median.stat <- function(x){
+    out <- quantile(x, probs = c(0.5))
+    names(out) <- c("ymed")
+    return(out) 
+}
+
+spc.combined_copy <- spc.combined
+spc.combined@active.ident <- factor(x = spc.combined@active.ident, levels = new.cluster.id)
+
+a <- 
+  VlnPlot(
+  spc.combined,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "tdTomatoWRPE"),
+  ncol = 2,
+  pt.size = 0,
+  combine = FALSE
+) 
+
+for (i in 1:length(a)) {
+  a[[i]] <- a[[i]] + 
+    geom_violin(trim = FALSE, scale = "width") + 
+    stat_summary(fun = median.stat, geom = 'point', size = 3, colour = "black") + 
+    NoLegend() + 
+    theme(axis.ticks.x = element_blank(), axis.title = element_blank())
+}
+
+a_plots <- wrap_plots(a, ncol = 2)
+a_plots
+```
+
+# Module scores of EC markers
+What kind of vessel associated cells are we marking? Checking top 100 genes expressed by pericytes and various EC populations in Betsholtz 2018 paper.
+
+```{r moduleVessels, fig.width=6, fig.height=6}
+
+# Load lists
+pericyte_genes <- read_excel('pericytes_vs_rest_betsholtz.xlsx', skip=1)
+FL1_genes <- read_excel('fibroblast_like_type_1_vs_rest_betsholtz.xlsx', skip=1)
+FL2_genes <- read_excel('fibroblast_like_type_2_vs_rest_betsholtz.xlsx', skip=1)
+vEC_genes <- read_excel('vEC_vs_rest_betsholtz.xlsx', skip=1)
+aEC_genes <- read_excel('aEC_vs_rest_betsholtz.xlsx', skip=1)
+capilEC_genes <- read_excel('capilEC_vs_rest_betsholtz.xlsx', skip=1)
+EC1_genes <- read_excel('EC1_vs_rest_betsholtz.xlsx', skip=1)
+EC2_genes <- read_excel('EC2_vs_rest_betsholtz.xlsx', skip=1)
+EC3_genes <- read_excel('EC3_vs_rest_betsholtz.xlsx', skip=1)
+
+
+pericyte_list <- list(pericyte_genes$Symbol)
+FL1_list <- list(FL1_genes$Symbol)
+FL2_list <- list(FL2_genes$Symbol)
+vEC_list <- list(vEC_genes$Symbol)
+aEC_list <- list(aEC_genes$Symbol)
+capilEC_list <- list(capilEC_genes$Symbol)
+EC1_list <- list(EC1_genes$Symbol)
+EC2_list <- list(EC2_genes$Symbol)
+EC3_list <- list(EC3_genes$Symbol)
+
+# Set module scores
+spc.combined <- AddModuleScore(spc.combined, features = pericyte_list, name = "Pericytes")
+spc.combined <- AddModuleScore(spc.combined, features = FL1_list, name = "FL1")
+spc.combined <- AddModuleScore(spc.combined, features = FL2_list, name = "FL2")
+spc.combined <- AddModuleScore(spc.combined, features = vEC_list, name = "vEC")
+spc.combined <- AddModuleScore(spc.combined, features = aEC_list, name = "aEC")
+spc.combined <- AddModuleScore(spc.combined, features = capilEC_list, name = "capilEC")
+spc.combined <- AddModuleScore(spc.combined, features = EC1_list, name = "EC1")
+spc.combined <- AddModuleScore(spc.combined, features = EC2_list, name = "EC2")
+spc.combined <- AddModuleScore(spc.combined, features = EC3_list, name = "EC3")
+
+# Plot module score
+a <- 
+  VlnPlot(
+  spc.combined,
+  features = c("Pericytes1", "FL11", "FL21", "vEC1", "aEC1", "capilEC1", "EC11", "EC21", "EC31"),
+  ncol = 3,
+  pt.size = 0,
+  combine = FALSE
+) 
+
+for (i in 1:length(a)) {
+  a[[i]] <- a[[i]] + 
+    geom_violin(trim = FALSE, scale = "width") + 
+    stat_summary(fun = median.stat, geom = 'point', size = 3, colour = "black") + 
+    NoLegend() + 
+    theme(axis.ticks.x = element_blank(), axis.title = element_blank())
+}
+
+a_plots <- wrap_plots(a, ncol = 3)
+a_plots
+
+```
+
+#  UMAP clusters + where they end up on the original PCA
+
+```{r pca2, fig.height = 3.5, fig.width = 8.5, eval = FALSE}
+names_umap <- DimPlot(
+  spc.combined,
+  reduction = "umap",
+  pt.size = 0.6
+) 
+spc.combined <-
+  RunPCA(spc.combined, features = VariableFeatures(object = spc.combined))
+
+names_pca <- DimPlot(spc.combined, reduction = "pca", label = TRUE, pt.size = 0.6) + NoLegend() 
+
+wrap_plots(list(names_umap, names_pca))
+```
+
+```{r pca3, fig.height = 7, fig.width = 4.5}
+names_umap <- DimPlot(
+  spc.combined,
+  reduction = "umap",
+  pt.size = 0.6
+) + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), axis.line = element_blank())
+
+lines_umap <- DimPlot(
+  spc.combined,
+  reduction = "umap",
+  group.by = "line",
+  pt.size = 0.6
+) + theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), axis.line = element_blank())
+
+wrap_plots(list(names_umap, lines_umap), ncol=1)
+```
+
+## Marker plot for fig
+
+```{r featurePlotsQual, fig.width = 17.5, fig.height = 2}
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'), guide = guide_colourbar(ticks = FALSE, label = FALSE))
+
+rem.border <- theme(panel.border = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.title.y.right = element_blank()) 
+
+rem.border.leg <- theme(panel.border = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.title.y.right = element_blank(), legend.position = "none") 
+
+a <- FeaturePlot(
+  spc.combined,
+  features = c(
+    "Fam183b", # EP all
+    "Ccdc153", # EP 1, ep cells
+    "Crym", # EP2 epc progeny dividing a lot
+    "Mt3", # EP3 epc progeny 
+    "Ptprb", # EC
+    "Col3a1", # fib/peri
+    "C1qc", # MG
+    "Bcan", # AS
+    "Ly6d"), # IMM
+  cols = c("lightgray", "red"),
+  combine = FALSE
+) 
+
+for (i in 1:length(a)) {
+  a[[i]] <- a[[i]] + scale_colour_gradientn(colours = alpha(c("lightgray", "red", "darkred"), .85))
+}
+
+a <- lapply(a, function (x) x + set.sc)
+a <- lapply(a, function (x) x + rem.border.leg)
+a <- wrap_plots(a, ncol = 9)
+a
+
+```
+
+```{r SaveRobj}
+save(spc.combined, file = "Troy_UI_Inj_spc_all_cells_save_21-07-10.Robj")
+```
+
+
+# Subset 
+Subsetting to study ependymal cells only. Here you can see that there are some doublets in the data set.
+
+```{r subset, fig.height = 3, fig.width = 3}
+epc.combined <-
+  subset(
+    spc.combined,
+    idents = c(
+      "EP 1",
+      "EP 2",
+      "EP 3"
+    )
+  )
+
+DimPlot(
+  epc.combined,
+  reduction = "umap",
+  label = TRUE,
+  pt.size = 0.3
+) + 
+  NoLegend() + 
+  scale_colour_brewer(palette = "Dark2")
+```
+
+# Handle doublets
+Plotting and filtering out cells expressing markers for i.e. fibrotic cells or nerve cells to get rid of doublets. 
+
+```{r Doublets, fig.width = 14, fig.height = 11}
+# Remove plausible doublets
+other_cells <- c("Pdgfrb", "Pdgfra", "Cd34", "Twist1", "Mgp", "Cdh5",  
+                 "Sox10", "Mbp", "Bcan", "Pecam1", "Cldn5", "Ptprc", "Ccr7", "Rbfox3", "Dcx")
+
+other_cells_markers <- c(
+  "Ptprc", "Cldn5", # EC
+  "Col3a1", "Pdgfrb", "Twist1", "Mgp", "Dcn", # fibrotic/peri
+  "Cdh5",
+  "Sox10",
+  "Bcan", # AS
+  "Ly6d", "Ccr7") # IMM
+
+VlnPlot(epc.combined, 
+        other_cells_markers, 
+        pt.size = 0.2
+        )
+
+FeaturePlot(epc.combined, 
+            other_cells_markers,
+            cols = c("lightgrey", "red"))
+
+
+epc.combined <- subset(epc.combined, 
+                     subset = 
+                       Pdgfrb < 0.5 &
+                       Twist1 < 0.5 &
+                       Cdh5 < 0.5 &
+                       Sox10 < 0.5 &
+                       Bcan < 1 &
+                       Cldn5 < 1 &
+                       Dcn < 1 &
+                       Ptprc < 0.5 &
+                       Ccr7 < 0.5)
+
+FeaturePlot(epc.combined, 
+            other_cells_markers,
+            cols = c("lightgrey", "red"))
+```
+
+## Save expression matrix containing only ependymal cells
+Doublets and other cell types filtered out. 
+
+```{r epExtraction}
+save(epc.combined, file = "Troy_UI_Inj_after_initial_filter_TOM_regTom_2021_07_10.Robj")
+```
+
+# Re-clustering 
+Clustering the ependymal cells that were subsetted out in the previous step. 
+
+## Feature selection
+```{r epFeatures}
+epc.combined <-
+  NormalizeData(epc.combined,
+                normalization.method = "LogNormalize",
+                scale.factor = 10000)
+
+epc.combined <-
+  FindVariableFeatures(epc.combined,
+                       selection.method = "vst",
+                       nfeatures = 2001)
+
+# Remove tdTomato-WRPE from var features list to not use that for clustering
+genes.remove <- c("tdTomatoWRPE")
+VariableFeatures(epc.combined) <- setdiff(VariableFeatures(epc.combined), genes.remove)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(epc.combined), 10)
+
+# Plot variable features with labels
+plot1 <- VariableFeaturePlot(epc.combined, pt.size = 0.4)
+plot1 <- LabelPoints(plot = plot1,
+                     points = top10,
+                     repel = TRUE)
+plot1
+```
+
+### (1) Determine dimensionality of dataset
+
+```{r epDimensionality, fig.width = 10, fig.height = 4.5}
+# JackStraw plot / Macosko et al.
+epc.combined <- JackStraw(epc.combined, num.replicate = 100)
+epc.combined <- ScoreJackStraw(epc.combined, dims = 1:20)
+jackstraw <- JackStrawPlot(epc.combined, dims = 1:20)
+
+#ElbowPlot
+elbow <- ElbowPlot(epc.combined)
+
+wrap_plots(plots = list(jackstraw, elbow))
+```
+
+### (2) Clustering w PCA + UMAP
+
+```{r epPCA, message = FALSE,  results ='hide'}
+all.genes <- rownames(epc.combined)
+epc.combined <- ScaleData(epc.combined, features = all.genes)
+
+# PCA
+epc.combined <-
+  RunPCA(epc.combined, features = VariableFeatures(object = epc.combined))
+```
+
+Using 17 dims based on Jackstraw result. Using a range of resolutions to test with ClusTree.
+
+```{r epClusters, fig.height=5.5, fig.width=11, message=FALSE, results='hide'}
+resolution.range <- seq(from = 0, to = 1, by = 0.1)
+
+epc.combined <- FindNeighbors(epc.combined, dims = 1:17)
+epc.combined <- FindClusters(epc.combined, resolution = resolution.range)
+
+head(Idents(epc.combined), 10)
+
+# UMAP
+epc.combined <- RunUMAP(epc.combined, dims = 1:17, seed.use = 33)
+plot1 <- DimPlot(epc.combined, reduction = "umap", label = TRUE)
+plot2 <- DimPlot(epc.combined, reduction = "umap", group.by = "line")
+wrap_plots(list(plot1, plot2))
+```
+
+### ClusTree
+Chose a resolution of 0.2 based on the ClusTree map 
+
+```{r ClusTreeEpC, message = FALSE}
+clustree(epc.combined)
+
+# Based on the cluster map, we decide to use a res of 0.2
+epc.combined <- FindClusters(epc.combined, resolution = 0.2)
+
+DimPlot(
+  epc.combined,
+  reduction = "umap",
+  label = TRUE,
+  pt.size = 0.5
+)
+```
+
+# Bar plots of cell cycle phase in each line/condition
+Categorised by CC score using markers for G2M and S phase from Tirosh et al., 2015
+
+```{r epCCprolifPerLine, message = FALSE, results ='hide', fig.keep = 'all'}
+theme_set(theme_cowplot())
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+s.genes <- str_to_title(s.genes)
+g2m.genes <- str_to_title(g2m.genes)
+
+# Remove any gene that is not in the rownames of the data frame being analyzed
+s.genes2 <- s.genes[s.genes %in% rownames(epc.combined)]
+g2m.genes2 <- g2m.genes[g2m.genes %in% rownames(epc.combined)]
+
+epc.combined <- CellCycleScoring(epc.combined, s.features = s.genes2, g2m.features = g2m.genes2, set.ident = TRUE)
+
+my_levels <- c("Troy_UI", "Troy_SCI")
+factor(epc.combined@meta.data$line, levels = my_levels)
+epc.combined@meta.data$line <- factor(epc.combined@meta.data$line, levels = my_levels)
+
+ggplot(epc.combined@meta.data, aes(x = line, fill = Phase)) + geom_bar(position = "fill")
+```
+
+# Vlnplot of CC scores
+
+```{r ccVlnEpC}
+g2m <- VlnPlot(epc.combined, features = "G2M.Score", group.by = "line", pt.size = 0.1) + NoLegend() + coord_cartesian(ylim = 0:1) + stat_summary(fun.y = median.stat, geom = 'point', size = 4, colour = "black")
+
+s <- VlnPlot(epc.combined, features = "S.Score", group.by = "line", pt.size = 0.1) + NoLegend() + coord_cartesian(ylim = 0:1) + stat_summary(fun.y = median.stat, geom = 'point', size = 4, colour = "black")
+
+wrap_plots(list(g2m, s))
+```
+
+# Featureplot of CC scores
+
+```{r ccFeatures, fig.width = 7, fig.height = 3}
+theme_set(theme_cowplot())
+#names(x = epc.combined[[]])
+
+a <- FeaturePlot(epc.combined, features = "G2M.Score", cols = c("lightgrey", "red"), order = TRUE)
+b <- FeaturePlot(epc.combined, features = "S.Score", cols = c("lightgrey", "red"), order = TRUE)
+
+wrap_plots(plots = list(a,b))
+```
+
+Running a PCA on cell cycle genes reveals, unsurprisingly, that cells separate ~entirely by phase. Decision to regress out G2M/S diff downstream.
+
+```{r epCCPCAbefore}
+epc.combined <- RunPCA(epc.combined, features = c(s.genes2, g2m.genes2))
+DimPlot(epc.combined, reduction = "pca") + scale_colour_brewer(palette = "Dark2") 
+```
+
+# Cell cycle regression 
+
+Regressing out the difference between the G2M and S phase scores. This means that signals separating non-cycling cells and cycling cells will be maintained, but differences in cell cycle phase amongst proliferating cells (which are often uninteresting), will be regressed out of the data.
+
+```{r ccRegression}
+epc.combined$CC.Difference <- epc.combined$S.Score - epc.combined$G2M.Score
+epc.combined <- ScaleData(epc.combined, vars.to.regress = "CC.Difference", features = rownames(epc.combined))
+```
+
+When running a PCA on only cell cycle genes, cells no longer separate by cell-cycle phase
+
+```{r epCCPCAafter}
+epc.combined <- RunPCA(epc.combined, features = c(s.genes2, g2m.genes2))
+DimPlot(epc.combined, reduction = "pca") + scale_colour_brewer(palette = "Dark2") 
+```
+
+# Feature selection
+
+Using var feature detection after CC regression.
+
+https://www.biostars.org/p/397206/
+Quote from discussion in link, makes sense;
+"Actually, it calculates a score based on the difference of mean expression of the given list and the mean expression of reference genes (randomly selected genes matching the distribution of the expression of the given list). Then regress out the scores for downstream analysis. Therefore, if you want to remove (hopefully) the cell cycle effect, you should do HVG analysis on the corrected data."
+
+```{r epCCFeatures}
+epc.combined <-
+  NormalizeData(epc.combined,
+                normalization.method = "LogNormalize",
+                scale.factor = 10000)
+
+epc.combined <-
+  FindVariableFeatures(epc.combined,
+                       selection.method = "vst",
+                       nfeatures = 2001)
+
+# Remove tdTomato from the variable features
+genes.remove <- c("tdTomatoWRPE")
+VariableFeatures(epc.combined) <- setdiff(VariableFeatures(epc.combined), genes.remove)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(epc.combined), 10)
+
+# Plot variable features with labels
+plot1 <- VariableFeaturePlot(epc.combined, pt.size = 0.4)
+plot1 <- LabelPoints(plot = plot1,
+                     points = top10,
+                     repel = TRUE)
+plot1
+```
+
+# PCA 
+
+```{r epCCpca, fig.width = 5, fig.height = 4}
+epc.combined <- RunPCA(epc.combined, features = VariableFeatures(object = epc.combined))
+
+DimPlot(epc.combined, reduction = "pca", group.by = "line", pt.size = 0.2) + scale_colour_brewer(palette = "Dark2") 
+```
+
+# Determine dimensionality of dataset 
+
+```{r epCCdimensionality, fig.width = 10, fig.height = 4.5}
+# JackStraw plot / Macosko et al.
+epc.combined <- JackStraw(epc.combined, num.replicate = 100)
+epc.combined <- ScoreJackStraw(epc.combined, dims = 1:20)
+jackstraw <- JackStrawPlot(epc.combined, dims = 1:20)
+
+# ElbowPlot
+elbow <- ElbowPlot(epc.combined)
+
+wrap_plots(plots = list(jackstraw, elbow))
+```
+
+# Clustering with UMAP
+Using 20 dims based on JackStraw result. 
+```{r epCCumap, fig.width = 11, fig.height = 5.5, message = FALSE, results ='hide', fig.keep = 'all'}
+res.range = seq(from = 0, to = 1, by = 0.1)
+
+epc.combined <- FindNeighbors(epc.combined, dims = 1:18)
+epc.combined <- FindClusters(epc.combined, resolution = res.range)
+
+head(Idents(epc.combined), 10)
+
+# UMAP
+epc.combined <- RunUMAP(epc.combined, dims = 1:18, seed.use = 42)
+
+plot1 <- DimPlot(epc.combined, reduction = "umap", label = TRUE) 
+plot2 <- DimPlot(epc.combined, reduction = "umap", group.by = "line") + scale_colour_brewer(palette = "Dark2")
+wrap_plots(plots = list(plot1, plot2))
+```
+
+# ClusTree
+```{r epCCClusTree, fig.width = 7, fig.height = 5, message = FALSE}
+clustree(epc.combined)
+```
+
+```{r EpCFindClusters, fig.width = 4, fig.height = 4}
+epc.combined <- FindClusters(epc.combined, resolution = 0.2)
+```
+
+```{r plotUMAP, fig.height = 5, fig.width = 5}
+p <- DimPlot(
+  epc.combined,
+  reduction = "umap",
+  label = TRUE,
+  pt.size = 0.6
+) + 
+  scale_colour_brewer(palette = "Dark2") +
+  geom_density_2d(aes(UMAP_1, UMAP_2), color = "gray", alpha = 0.5)
+
+p2 <- HoverLocator(plot = p, information = FetchData(epc.combined, vars = c("ident", "line", "nFeature_RNA", "percent.mito")))
+p2
+```
+
+# Naming clusters
+
+```{r nameEpCClusters, fig.width = 10, fig.height = 5}
+new.cluster.id <-
+  c(
+    "EpA1",
+    "EpA2", 
+    "EpA3"
+  )
+
+names(new.cluster.id) <- levels(epc.combined)
+epc.combined <- RenameIdents(epc.combined, new.cluster.id)
+```
+
+# EpA cell clusters QC
+
+```{r ClusQC, fig.width = 4.3, fig.height = 2}
+
+a <- VlnPlot(
+  epc.combined,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), 
+  group.by = "seurat_clusters",
+  combine = FALSE,
+  pt.size = 0,
+  cols = brewer.pal(6, "Dark2")
+) 
+
+for (i in 1:length(a)) {
+  a[[i]] <- a[[i]] + 
+    geom_violin(trim = FALSE, scale = "width") + 
+    stat_summary(fun = median.stat, geom = 'point', size = 3, colour = "black") + 
+    NoLegend() + 
+    theme(axis.ticks.x = element_blank(), axis.title = element_blank())
+}
+
+a_plots <- wrap_plots(a, ncol = 4)
+a_plots
+```
+
+# UMAP grouped by cluster, and by source (uninjured or 3 dpi spinal cord)
+
+```{r GroupByLineUMAP, fig.width = 6.75, fig.height = 2.5}
+p <- DimPlot(
+  epc.combined,
+  reduction = "umap",
+  label = FALSE,
+  pt.size = 0.6
+) + 
+  scale_colour_brewer(palette = "Dark2") +
+  geom_density_2d(aes(UMAP_1, UMAP_2), color = "gray", alpha = 0.5) + 
+  theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), axis.line = element_blank())
+
+p3 <- DimPlot(
+  epc.combined,
+  reduction = "umap",
+  group.by = "line",
+  pt.size = 0.8
+) + 
+  scale_colour_brewer(palette = "Dark2") +
+  geom_density_2d(aes(UMAP_1, UMAP_2), color = "gray", alpha = 0.5) + 
+  theme(axis.text = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), axis.line = element_blank())
+
+wrap_plots(plots = list(p, p3))
+```
+
+```{r epCCumapPerLine, fig.width = 6.5, fig.height = 3}
+DimPlot(
+  epc.combined,
+  reduction = "umap",
+  split.by = "line",
+ # label = TRUE,
+  pt.size = 1.0
+) + 
+  scale_colour_brewer(palette = "Dark2") +
+  geom_density_2d(aes(UMAP_1, UMAP_2), color = "gray", alpha = 0.5)
+```
+
+# How many cells from each line in each cluster
+
+```{r epCellCounts}
+# Number
+table(Idents(epc.combined), epc.combined$line)
+
+# Proportion
+prop.table(table(Idents(epc.combined), epc.combined$line), margin = 2)
+```
+
+# Bar plots of clusters by condition
+
+```{r epCCumapClusters, fig.height = 2, fig.width = 1.8}
+
+theme_set(theme_cowplot())
+
+ggplot(epc.combined@meta.data, aes(x = seurat_clusters, fill = line)) + geom_bar() + scale_fill_brewer(palette = "Dark2") 
+ggplot(epc.combined@meta.data, aes(x = seurat_clusters, fill = line)) + geom_bar(position = "fill") + scale_fill_brewer(palette = "Dark2")
+
+ggplot(epc.combined@meta.data, aes(x = line, fill = seurat_clusters)) + geom_bar(position = "fill") + scale_fill_brewer(palette = "Dark2", guide = guide_legend(title = "Cluster")) + labs(y = "Share of cells in each cluster") + theme(axis.title.x = element_blank()) 
+
+```
+
+# Featureplot of cc / mito scores
+
+```{r chartFeatures, fig.width = 9, fig.height = 4}
+theme_set(theme_cowplot())
+
+a <- FeaturePlot(epc.combined, features = "G2M.Score", cols = c("lightgrey", "red"), order = TRUE)
+b <- FeaturePlot(epc.combined, features = "S.Score", cols = c("lightgrey", "red"), order = TRUE)
+
+wrap_plots(plots = list(a,b))
+
+c <- FeaturePlot(epc.combined, features = "percent.mito", cols = c("lightgrey", "red"), order = TRUE)
+d <- FeaturePlot(epc.combined, features = "nFeature_RNA", cols = c("lightgrey", "red"), order = TRUE)
+
+wrap_plots(plots = list(c,d))
+```
+
+# Feature and gene counts 
+
+```{r nGenes, fig.width = 10, fig.height = 4, eval = FALSE}
+
+a <- VlnPlot(
+  epc.combined,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), 
+  group.by = "line",
+  combine = FALSE,
+  pt.size = 0.2,
+  cols = brewer.pal(2, "Dark2")
+) 
+a + scale_fill_brewer(palette = "Dark2")
+wrap_plots(a, ncol = 3)
+
+b <- VlnPlot(
+  epc.combined,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), 
+  group.by = "seurat_clusters",
+  pt.size = 0.2,
+  combine = FALSE,
+  cols = brewer.pal(6, "Dark2")
+) 
+
+wrap_plots(b)
+```
+
+
+# Feature plots for fig
+
+```{r featDiffFig, fig.width = 17, fig.height = 4}
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 4.5))
+rem.border <- theme(panel.border = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.title.y.right = element_blank()) 
+rem.border.leg <- theme(panel.border = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.title.y.right = element_blank(), legend.position = "none") 
+
+a <- FeaturePlot(epc.combined, 
+            features = c("Fam183b"),
+            split.by = "line",
+            combine = FALSE) 
+
+a <- lapply(a, function (x) x + set.sc)
+a <- lapply(a, function (x) x + rem.border.leg)
+a <- wrap_plots(a, ncol = 1)
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 3))
+
+b <- FeaturePlot(epc.combined, 
+            features = c("Foxj1"),
+            split.by = "line",
+            combine = FALSE) 
+
+b <- lapply(b, function (x) x + set.sc)
+b <- lapply(b, function (x) x + rem.border.leg)
+b <- wrap_plots(b, ncol = 1)
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 3))
+
+c <- FeaturePlot(epc.combined, 
+            features = c("Olig1"),
+            split.by = "line",
+            combine = FALSE) 
+
+c <- lapply(c, function (x) x + set.sc)
+c <- lapply(c, function (x) x + rem.border.leg)
+c <- wrap_plots(c, ncol = 1)
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 4.5))
+
+d <- FeaturePlot(epc.combined, 
+            features = c("Gfap"),
+            split.by = "line",
+            combine = FALSE) 
+
+d <- lapply(d, function (x) x + set.sc)
+d <- lapply(d, function (x) x + rem.border.leg)
+d <- wrap_plots(d, ncol = 1)
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 1.7))
+
+e <- FeaturePlot(epc.combined, 
+            features = c("Ascl1"),
+            split.by = "line",
+            combine = FALSE) 
+
+e <- lapply(e, function (x) x + set.sc)
+e <- lapply(e, function (x) x + rem.border.leg)
+e <- wrap_plots(e, ncol = 1)
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 2.1))
+
+f <- FeaturePlot(epc.combined, 
+            features = c("Aldh1l1"),
+            split.by = "line",
+            combine = FALSE) 
+
+f <- lapply(f, function (x) x + set.sc)
+f <- lapply(f, function (x) x + rem.border.leg)
+f <- wrap_plots(f, ncol = 1)
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 2))
+
+g <- FeaturePlot(epc.combined, 
+            features = c("Olig2"),
+            split.by = "line",
+            combine = FALSE) 
+
+g <- lapply(g, function (x) x + set.sc)
+g <- lapply(g, function (x) x + rem.border.leg)
+g <- wrap_plots(g, ncol = 1)
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 2.7), guide = guide_colourbar(ticks = FALSE, label = FALSE))
+
+h <- FeaturePlot(epc.combined, 
+            features = c("Mki67"),
+            split.by = "line",
+            combine = FALSE) 
+
+h <- lapply(h, function (x) x + set.sc)
+h <- lapply(h, function (x) x + rem.border)
+h <- wrap_plots(h, ncol = 1)
+
+(b | a | d | e | f | c | g | h)
+
+```
+
+
+```{r featDiffSuppFig, fig.width = 16, fig.height = 4}
+
+rem.border <- theme(panel.border = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.title.y.right = element_blank()) 
+rem.border.leg <- theme(panel.border = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.title.y.right = element_blank(), legend.position = "none") 
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 4.5))
+
+z <- FeaturePlot(epc.combined, 
+            features = c("Fam183b"),
+            split.by = "line",
+            combine = FALSE) 
+
+z <- lapply(z, function (x) x + set.sc)
+z <- lapply(z, function (x) x + rem.border.leg)
+z <- wrap_plots(z, ncol = 1)
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 4.9))
+
+a <- FeaturePlot(epc.combined, 
+            features = c("Rarres2"),
+            split.by = "line",
+            combine = FALSE) 
+
+a <- lapply(a, function (x) x + set.sc)
+a <- lapply(a, function (x) x + rem.border.leg)
+a <- wrap_plots(a, ncol = 1)
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 4))
+
+b <- FeaturePlot(epc.combined, 
+            features = c("Tmem212"),
+            split.by = "line",
+            combine = FALSE) 
+
+b <- lapply(b, function (x) x + set.sc)
+b <- lapply(b, function (x) x + rem.border.leg)
+b <- wrap_plots(b, ncol = 1)
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 1.8), guide = guide_colourbar(ticks = FALSE, label = FALSE))
+
+c <- FeaturePlot(epc.combined, 
+            features = c("Tnfrsf19"),
+            split.by = "line",
+            combine = FALSE) 
+
+c <- lapply(c, function (x) x + set.sc)
+c <- lapply(c, function (x) x + rem.border.leg)
+c <- wrap_plots(c, ncol = 1)
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 3.5))
+
+d <- FeaturePlot(epc.combined, 
+            features = c("Sox9"),
+            split.by = "line",
+            combine = FALSE) 
+
+d <- lapply(d, function (x) x + set.sc)
+d <- lapply(d, function (x) x + rem.border.leg)
+d <- wrap_plots(d, ncol = 1)
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 3.5))
+
+e <- FeaturePlot(epc.combined, 
+            features = c("Sox2"),
+            split.by = "line",
+            combine = FALSE) 
+
+e <- lapply(e, function (x) x + set.sc)
+e <- lapply(e, function (x) x + rem.border.leg)
+e <- wrap_plots(e, ncol = 1)
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(0, 6.5), guide = guide_colourbar(ticks = FALSE, label = FALSE))
+
+f <- FeaturePlot(epc.combined, 
+            features = c("Vim"),
+            split.by = "line",
+            combine = FALSE) 
+
+f <- lapply(f, function (x) x + set.sc)
+f <- lapply(f, function (x) x + rem.border.leg)
+f <- wrap_plots(f, ncol = 1)
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(-0.12, 1))
+
+g <- FeaturePlot(epc.combined, 
+            features = c("S.Score"),
+            split.by = "line",
+            combine = FALSE) 
+
+g <- lapply(g, function (x) x + set.sc)
+g <- lapply(g, function (x) x + rem.border.leg)
+g <- wrap_plots(g, ncol = 1)
+
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', 'red', 'darkred'),  limits = c(-0.19, 1.7), guide = guide_colourbar(ticks = FALSE, label = FALSE))
+
+h <- FeaturePlot(epc.combined, 
+            features = c("G2M.Score"),
+            split.by = "line",
+            combine = FALSE) 
+
+h <- lapply(h, function (x) x + set.sc)
+h <- lapply(h, function (x) x + rem.border)
+h <- wrap_plots(h, ncol = 1)
+
+( z | a | b | c | d | e | g | h )
+
+```
+
+# Find markers for the clusters
+
+Identifying additional marker genes for clusters and cluster gangs. Useful for handling doublets.
+
+```{r EpClusMarkers}
+# Cluster 0 markers
+eclus0.markers <- FindMarkers(epc.combined, ident.1 = 0 , group.by = "seurat_clusters", only.pos = TRUE)
+
+eclus0.markers.pval <- subset(eclus0.markers, subset = (p_val_adj < 0.05)) # & pct.1 > 0.5 & pct.2 < 0.1
+print("EpC cluster 0 markers:")
+print(eclus0.markers.pval)
+eclus0.markers.pval_vec <- rownames(eclus0.markers.pval)
+eclus0_top25_vec <- eclus0.markers.pval_vec[0:25]
+
+# Cluster 1 markers
+eclus1.markers <- FindMarkers(epc.combined, ident.1 = 1 , group.by = "seurat_clusters", only.pos = TRUE)
+
+eclus1.markers.pval <- subset(eclus1.markers, subset = (p_val_adj < 0.05)) # & pct.1 > 0.5 & pct.2 < 0.1
+print("EpC cluster 1 markers:")
+print(eclus1.markers.pval)
+
+eclus1.markers.pval_vec <- rownames(eclus1.markers.pval)
+print(eclus1.markers.pval_vec)
+eclus1_top25_vec <- eclus1.markers.pval_vec[0:25]
+
+# Cluster 2 markers
+eclus2.markers <- FindMarkers(epc.combined, ident.1 = 2 , group.by = "seurat_clusters", only.pos = TRUE)
+
+# Subset to create list of markers for cluster 2 cells.
+eclus2.markers.pval <- subset(eclus2.markers, subset = (p_val_adj < 0.05)) # & pct.1 > 0.5 & pct.2 < 0.1
+print("EpC cluster 2 markers:")
+print(eclus2.markers.pval)
+
+eclus2.markers.pval_vec <- rownames(eclus2.markers.pval)
+eclus2_top25_vec <- eclus2.markers.pval_vec[0:25]
+```
+
+# Heatmap between the clusters using top 25 diff genes for each cluster
+
+```{r ClusterHeatMapMarkers, fig.width = 5.5, fig.height = 7}
+DE_ClusterFeatures <- c(eclus0.markers.pval_vec[1:25], eclus1.markers.pval_vec[1:25], eclus2.markers.pval_vec[1:25]) 
+
+# Save cluster DE's for EpA1,2 and 3
+write.xlsx(eclus0.markers.pval, file = "Table_1_EpA1.xlsx")
+write.xlsx(eclus1.markers.pval, file = "Table_1_EpA2.xlsx")
+write.xlsx(eclus2.markers.pval, file = "Table_1_EpA3.xlsx")
+
+# Plot 
+myPalette <- c("#006164", "#57C4AD", "#E6E1BC", "#EDA247", "#DB4325")
+
+DoHeatmap(epc.combined, features = DE_ClusterFeatures, group.by = "seurat_clusters", size = 6, angle = 45, group.colors = brewer.pal(3, "Dark2")) +     
+  scale_fill_gradientn(colors = myPalette)
+
+my_levels <- c("UI", "SCI")
+epc.combined$cond <- factor(epc.combined$cond, levels = my_levels)
+
+DoHeatmap(epc.combined, 
+          features = DE_ClusterFeatures, 
+          group.by = "cond", 
+          size = 6, angle = 90, 
+          group.colors = brewer.pal(3, "Dark2")) +     
+  scale_fill_gradientn(colors = myPalette)
+``` 
+
+# Module Scores: EpCs vs. SVZ
+Using Module Score to look at the similarities between different groups of EpCs vs. markers of NSCs in the brain
+
+```{r ModuleScore, fig.width = 7, fig.height = 3}
+
+# NSC signature that Margh pulled out of SVZ data set (not good at distinguishing between AC and NSC in brain)
+svz_allTypes <- readRDS("../gene_modules_neurogenic_cells.rds")
+
+# Signature lists from Marghs SVZ analysis
+NSC_SVZ <-
+  list(c("S100a6", "Sparc", "Sfrp1", "Igfbp5", "Ascl1", "Fbxo2"))
+TAP_SVZ <- list(svz_allTypes$TAPs)
+
+#Save the NSC SVZ and TAP SVZ signatures as csv files
+NSC_SVZ.df <- do.call("rbind", lapply(NSC_SVZ, as.data.frame)) 
+TAP_SVZ.df <- do.call("rbind", lapply(TAP_SVZ, as.data.frame)) 
+
+write.csv(NSC_SVZ.df, file = "Table_3_NSC_SVZ_gene_modules_incl_cc.csv")
+write.csv(TAP_SVZ.df, file = "Table_4_TAP_SVZ_gene_modules_incl_cc.csv")
+
+# Set module score
+epc.combined <- AddModuleScore(epc.combined, features = NSC_SVZ, name = "NSC_SVZ")
+epc.combined <- AddModuleScore(epc.combined, features = TAP_SVZ, name = "TAP_SVZ")
+
+# NSC signature from SVZ, extracted by Margherita
+a <-
+  FeaturePlot(
+    object = epc.combined,
+    features = "NSC_SVZ1",
+    cols = c("lightgrey", "red", "darkred")
+  )
+b <-
+  VlnPlot(
+    object = epc.combined,
+    features = "NSC_SVZ1",
+    group.by = "seurat_clusters",
+    pt.size = 0.1,
+    cols = brewer.pal(3, "Dark2")
+  )
+wrap_plots(plots = list(a, b))
+
+#TAP signature from SVZ, extracted by Margherita
+a <-
+  FeaturePlot(
+    object = epc.combined,
+    features = "TAP_SVZ1",
+    cols = c("lightgrey", "red", "darkred")
+  )
+b <-
+  VlnPlot(
+    object = epc.combined,
+    features = "TAP_SVZ1",
+    group.by = "seurat_clusters",
+    pt.size = 0.1,
+    cols = brewer.pal(3, "Dark2")
+  )
+wrap_plots(plots = list(a, b))
+```
+
+```{r cleanModuleNSC, fig.height = 2.5, fig.width = 1.5}
+a <-
+  VlnPlot(
+    object = epc.combined,
+    features = "NSC_SVZ1",
+    group.by = "seurat_clusters",
+    pt.size = 0,
+    cols = brewer.pal(3, "Dark2")
+  ) + geom_violin(trim = FALSE, scale = "width") +
+      stat_summary(fun = median.stat, geom = 'point', size = 3, colour = "black") +
+      NoLegend() +
+      theme(axis.ticks.x = element_blank(), axis.title = element_blank())
+a
+
+b <-
+  VlnPlot(
+    object = epc.combined,
+    features = "TAP_SVZ1",
+    group.by = "seurat_clusters",
+    pt.size = 0,
+    cols = brewer.pal(3, "Dark2")
+  ) + geom_violin(trim = FALSE, scale = "width") +
+      stat_summary(fun = median.stat, geom = 'point', size = 3, colour = "black") +
+      NoLegend() +
+      theme(axis.ticks.x = element_blank(), axis.title = element_blank())
+b
+
+```
+
+# Add signaling entropy to Seurat object
+
+```{r addSR}
+load("../SR_Troy_210710.robj")
+
+rownames(dfs2) <- dfs2$rn
+dfs3 <- dfs2[, -c(1, 4:6)]
+
+epc.combined <- AddMetaData(epc.combined, dfs3)
+```
+
+# Plot signaling entropy
+
+```{r featPlotSR}
+FeaturePlot(epc.combined, features = "SR") + scale_colour_gradientn(colours = c("lightgray", "yellow", "red"))
+
+ggplot(dfs2, aes(x = UMAP_1, y = UMAP_2, col = epc.combined.seurat_clusters)) + geom_point() + scale_color_brewer("Cluster", palette = "Dark2")
+ggplot(dfs2, aes(x = UMAP_1, y = UMAP_2, col = SR)) + geom_point() + scale_colour_gradientn(colours = c("lightgray", "yellow", "red"))
+```
+
+```{r SR_normality_sig_tests}
+ggdensity(dfs2, x = "SR",
+   add = "median", rug = TRUE,
+   color = "epc.combined.seurat_clusters", palette = c("#00AFBB", "#E7B800", "#9370db"))
+
+# QQ plot
+ggqqplot(dfs2, x = "SR", color = "epc.combined.seurat_clusters", palette = c("#00AFBB", "#E7B800", "#9370db"))
+## --> the data looks skewed as seen at the extremes
+
+# Kruskal Wallis test
+kruskal.test(SR ~ epc.combined.seurat_clusters, data = dfs2)
+## --> There are significant differences between the groups
+
+dunn.test(x=dfs2$SR, g=dfs2$epc.combined.seurat_cluster)
+## --> 0 <-> 1 and 1 <-> 2 both significantly differ from each other
+```
+
+```{r SCENIClocal, eval=FALSE}
+org = "mgi" # Species
+
+dbs <- list('500bp'= 'mm10__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.feather', 
+            '10kb' = 'mm10__refseq-r80__10kb_up_and_down_tss.mc9nr.feather')
+dbDir <- '~/Documents/CMB/10X/tom/Analysis/cisTarget_databases'
+db_mcVersion <- 'v9'
+## Run on local#source("./code/global.R", local = FALSE)
+
+scenicOptions <- readRDS("int/scenicOptions.Rds")
+scenicOptions@settings$nCores <- 2
+scenicOptions@settings$seed <- 123
+scenicOptions@settings$verbose <- TRUE
+
+runSCENIC_1_coexNetwork2modules(scenicOptions)
+runSCENIC_2_createRegulons(scenicOptions)
+```
+
+```{r SCENIClocal2, eval=FALSE}
+library(doMC)
+
+exprMat <- as.matrix(epc.combined[["RNA"]]@counts) # Extracting count data from epc seurat object
+runSCENIC_3_scoreCells(scenicOptions, exprMat)
+
+aucell_regulonAUC <- loadInt(scenicOptions, "aucell_regulonAUC")
+
+runSCENIC_4_aucell_binarize(scenicOptions)
+
+regulons <- loadInt(scenicOptions, "regulons")
+
+regulonAUC <- loadInt(scenicOptions, "aucell_regulonAUC")
+regulonAUC <- regulonAUC[onlyNonDuplicatedExtended(rownames(regulonAUC)),]
+    
+## Add SCENIC output as metadata
+epc_scenic <- AddMetaData(epc.combined, as.data.frame(cbind(cellInfo,t(getAUC(regulonAUC)))))
+
+# Save ep seurat w SCENIC
+saveRDS(epc_scenic, file = "troy_scenic_seurat.rds")
+```
+
+```{r SCENICcheckup, eval = FALSE}
+# Load scenicOptions file
+#scenicOptions <- readRDS("int/scenicOptions.rds")
+
+# Load cellInfo
+cellInfo <- readRDS("int/cellInfo.rds")
+
+# Load Seurat object with SCENIC output
+#epc.scenic <- readRDS("scenic_200912/troy_scenic_seurat.rds")
+```
+
+```{r SCENICbind, eval = FALSE}
+library(AUCell)
+regulonAUC <- readRDS("int/3.4_regulonAUC.rds")
+
+## Add SCENIC output as metadata
+epc.scenic <- AddMetaData(epc.combined, as.data.frame(cbind(cellInfo,t(getAUC(regulonAUC)))))
+
+# Save ep seurat w SCENIC
+saveRDS(epc.scenic, file = "2107_troy_scenic_seurat.rds")
+```
+
+```{r grn1, fig.height = 4, fig.width = 7}
+rem.border <- theme(panel.border = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.title.y.right = element_blank()) 
+
+rem.border.leg <- theme(panel.border = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.title.y.right = element_blank(), legend.position = "none") 
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', '#339966', '#0a1e14'),  limits = c(0, 0.27))
+
+b <- FeaturePlot(epc.scenic, 
+            features = c("Rfx2..2014g."), 
+            split.by = "line",
+            pt.size = 1,
+            combine = FALSE)
+
+b <- lapply(b, function (x) x + set.sc)
+b <- lapply(b, function (x) x + rem.border.leg) 
+b <- wrap_plots(b, ncol = 1)
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', '#339966', '#0a1e14'),  limits = c(0, 0.41))
+
+c <- FeaturePlot(epc.scenic, 
+            features = c("Rfx3..3048g."), 
+            split.by = "line",
+            pt.size = 1,
+            combine = FALSE)
+
+c <- lapply(c, function (x) x + set.sc)
+c <- lapply(c, function (x) x + rem.border.leg) 
+c <- wrap_plots(c, ncol = 1)
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', '#339966', '#0a1e14'),  limits = c(0, 0.25), guide = guide_colourbar(ticks = FALSE, label = FALSE))
+
+d <- FeaturePlot(epc.scenic, 
+            features = c("Srebf1..1945g."), 
+            split.by = "line",
+            pt.size = 1,
+            combine = FALSE)
+
+d <- lapply(d, function (x) x + set.sc)
+d <- lapply(d, function (x) x + rem.border) 
+d <- wrap_plots(d, ncol = 1)
+
+(b | c | d)
+```
+
+```{r grn2, fig.height = 4, fig.width = 7}
+rem.border <- theme(panel.border = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.title.y.right = element_blank()) 
+
+rem.border.leg <- theme(panel.border = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.title.y.right = element_blank(), legend.position = "none") 
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', '#339966', '#0a1e14'),  limits = c(0, 0.13))
+
+a <- FeaturePlot(epc.scenic, 
+            features = c("Sox4..30g."), 
+            split.by = "line",
+            pt.size = 1,
+            combine = FALSE)
+
+a <- lapply(a, function (x) x + set.sc)
+a <- lapply(a, function (x) x + rem.border.leg)
+a <- wrap_plots(a, ncol = 1)
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', '#339966', '#0a1e14'),  limits = c(0, 0.04))
+
+b <- FeaturePlot(epc.scenic, 
+            features = c("Sox11..306g."), 
+            split.by = "line",
+            pt.size = 1,
+            combine = FALSE)
+
+b <- lapply(b, function (x) x + set.sc)
+b <- lapply(b, function (x) x + rem.border.leg) 
+b <- wrap_plots(b, ncol = 1)
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', '#339966', '#0a1e14'),  limits = c(0, 0.09), guide = guide_colourbar(ticks = FALSE, label = FALSE))
+
+c <- FeaturePlot(epc.scenic, 
+            features = c("Tead2_extended..744g."), 
+            split.by = "line",
+            pt.size = 1,
+            combine = FALSE)
+
+c <- lapply(c, function (x) x + set.sc)
+c <- lapply(c, function (x) x + rem.border.leg) 
+c <- wrap_plots(c, ncol = 1)
+
+(a | b | c )
+```
+
+```{r grn3, fig.height = 4, fig.width = 7}
+rem.border <- theme(panel.border = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.title.y.right = element_blank()) 
+
+rem.border.leg <- theme(panel.border = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.title.y.right = element_blank(), legend.position = "none") 
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', '#339966', '#0a1e14'),  limits = c(0.015, 0.08))
+
+a <- FeaturePlot(epc.scenic, 
+            features = c("Pole3..583g."), 
+            split.by = "line",
+            pt.size = 1,
+            combine = FALSE)
+
+a <- lapply(a, function (x) x + set.sc)
+a <- lapply(a, function (x) x + rem.border.leg)
+a <- wrap_plots(a, ncol = 1)
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', '#339966', '#0a1e14'),  limits = c(0.025, 0.38), guide = guide_colourbar(ticks = FALSE, label = FALSE))
+
+c <- FeaturePlot(epc.scenic, 
+            features = c("Ezh2_extended..3685g."), 
+            split.by = "line",
+            pt.size = 1,
+            combine = FALSE)
+
+c <- lapply(c, function (x) x + set.sc)
+c <- lapply(c, function (x) x + rem.border) 
+c <- wrap_plots(c, ncol = 1)
+
+set.sc <- scale_color_gradientn(colours = c('lightgrey', '#339966', '#0a1e14'),  limits = c(0, 0.08))
+
+d <- FeaturePlot(epc.scenic, 
+            features = c("Brca1..183g."), 
+            split.by = "line",
+            pt.size = 1,
+            combine = FALSE)
+
+d <- lapply(d, function (x) x + set.sc)
+d <- lapply(d, function (x) x + rem.border.leg) 
+d <- wrap_plots(d, ncol = 1)
+
+(a | d | c)
+```
+
+## Save final epc seurat object
+
+```{r epExtraction}
+save(epc.combined, file = "Troy_UI_Inj_after_analysis_pipe_TOM_regTom_2021_07_10.Robj")
+```
+
+## Load Monocle3 seurat object with e-cells
+
+```{r Monocle3Seurat}
+# Load monocle 3 Seurat object
+load("../epc.combined.pseudo_2107.Robj")
+```
+
+# Plot expression of GO terms along pseudotime axis 
+
+```{r GOpseudotime2, fig.height = 2, fig.width = 6}
+#Pull lists from some GO terms identified as enriched in the various clusters + add them as module scores in the seurat object
+mouse <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+
+translation_go <- c(GOBPOFFSPRING[["GO:0006412"]], "GO:0006412")
+genes.translation_go <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = translation_go, mart = mouse)
+translation_go_list <- list(genes.translation_go$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = translation_go_list, name = "Translation_GO")
+
+lipid_metabolic_go <- c(GOBPOFFSPRING[["GO:0006629"]], "GO:0006629")
+genes.lipid_metabolic_go <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = lipid_metabolic_go, mart = mouse)
+lipid_metabolic_go_list <- list(genes.lipid_metabolic_go$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = lipid_metabolic_go_list, name = "Lipid_metabolic_process_GO")
+
+FAO_go <- c(GOBPOFFSPRING[["GO:0019395"]], "GO:0019395")
+genes.FAO_go <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = FAO_go, mart = mouse)
+FAO_go_list <- list(genes.FAO_go$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = FAO_go_list, name = "FAO_GO")
+
+lipid_biosynthesis_go <- c(GOBPOFFSPRING[["GO:0008610"]], "GO:0008610")
+genes.lipid_biosynthesis_go <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = lipid_biosynthesis_go, mart = mouse)
+lipid_biosynthesis_go_list <- list(genes.lipid_biosynthesis_go$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = lipid_biosynthesis_go_list, name = "Lipid_biosynthesis_GO")
+
+carbohydrate_metabolic_go <- c(GOBPOFFSPRING[["GO:0005975"]], "GO:0005975")
+genes.carbohydrate_metabolic_go <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = carbohydrate_metabolic_go, mart = mouse)
+carbohydrate_metabolic_go_list <- list(genes.carbohydrate_metabolic_go$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = carbohydrate_metabolic_go_list, name = "Carbohydrate_metabolic_process_GO")
+
+glycolysis_go <- c(GOBPOFFSPRING[["GO:0006096"]], "GO:0006096")
+genes.glycolysis_go <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = glycolysis_go, mart = mouse)
+glycolysis_go_list <- list(genes.glycolysis_go$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = glycolysis_go_list, name = "Glycolysis_GO")
+
+cell_diff_go <- c(GOBPOFFSPRING[["GO:0030154"]], "GO:0030154")
+genes.cell_diff <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = cell_diff_go, mart = mouse)
+cell_diff_go_list <- list(genes.cell_diff$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = cell_diff_go_list, name = "Cell_differentiation_GO")
+
+cell_diff_pos_go <- c(GOBPOFFSPRING[["GO:0045597"]], "GO:0045597")
+genes.cell_diff_pos <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = cell_diff_pos_go, mart = mouse)
+cell_diff_pos_go_list <- list(genes.cell_diff_pos$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = cell_diff_pos_go_list, name = "Cell_differentiation_POS_GO")
+
+cell_diff_neg_go <- c(GOBPOFFSPRING[["GO:0045596 "]], "GO:0045596 ")
+genes.cell_diff_neg <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = cell_diff_neg_go, mart = mouse)
+cell_diff_neg_go_list <- list(genes.cell_diff_neg$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = cell_diff_neg_go_list, name = "Cell_differentiation_NEG_GO")
+
+glial_cell_diff_go <- c(GOBPOFFSPRING[["GO:0010001"]], "GO:0010001")
+genes.glial_cell_diff <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = glial_cell_diff_go, mart = mouse)
+glial_cell_diff_go_list <- list(genes.glial_cell_diff$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = glial_cell_diff_go_list, name = "Glial_cell_differentiation_GO")
+
+oligodendrocyte_diff_go <- c(GOBPOFFSPRING[["GO:0048709"]], "GO:0048709")
+genes.oligodendrocyte_diff <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = oligodendrocyte_diff_go, mart = mouse)
+oligodendrocyte_diff_go_list <- list(genes.oligodendrocyte_diff$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = oligodendrocyte_diff_go_list, name = "Oligodendrocyte_differentiation_GO")
+
+neurogenesis_go <- c(GOBPOFFSPRING[["GO:0022008"]], "GO:0022008")
+genes.neurogenesis <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = neurogenesis_go, mart = mouse)
+neurogenesis_go_list <- list(genes.neurogenesis$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = neurogenesis_go_list, name = "Neurogenesis_GO")
+
+cell_migration_go <- c(GOBPOFFSPRING[["GO:0016477"]], "GO:0016477")
+genes.cell_migration <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = cell_migration_go, mart = mouse)
+cell_migration_go_list <- list(genes.cell_migration$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = cell_migration_go_list, name = "Cell_migration_GO")
+
+cell_population_proliferation_go <- c(GOBPOFFSPRING[["GO:0008283"]], "GO:0008283")
+genes.cell_population_proliferation <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = cell_population_proliferation_go, mart = mouse)
+cell_population_proliferation_go_list <- list(genes.cell_population_proliferation$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = cell_population_proliferation_go_list, name = "Cell_population_proliferation_GO")
+
+pos_reg_stem_cell_prolif_go <- c(GOBPOFFSPRING[["GO:2000648"]], "GO:2000648")
+genes.pos_reg_stem_cell_prolif <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = pos_reg_stem_cell_prolif_go, mart = mouse)
+pos_reg_stem_cell_prolif_go_list <- list(genes.pos_reg_stem_cell_prolif$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = pos_reg_stem_cell_prolif_go_list, name = "pos_reg_stem_cell_prolif_GO")
+
+```
+
+# Plot expression of GO terms along pseudotime axis 
+
+```{r addGOterms, fig.height = 2, fig.width = 6}
+#Pull lists from some GO terms identified as enriched in the various clusters + add them as module scores in the seurat object
+mouse <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+
+cell_diff_neg_go <- c(GOBPOFFSPRING[["GO:0045596 "]], "GO:0045596 ")
+genes.cell_diff_neg <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = cell_diff_neg_go, mart = mouse)
+cell_diff_neg_go_list <- list(genes.cell_diff_neg$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = cell_diff_neg_go_list, name = "Cell_differentiation_NEG_GO")
+
+cell_migration_go <- c(GOBPOFFSPRING[["GO:0016477"]], "GO:0016477")
+genes.cell_migration <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = cell_migration_go, mart = mouse)
+cell_migration_go_list <- list(genes.cell_migration$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = cell_migration_go_list, name = "Cell_migration_GO")
+
+cell_population_proliferation_go <- c(GOBPOFFSPRING[["GO:0008283"]], "GO:0008283")
+genes.cell_population_proliferation <- getBM(attributes=c('mgi_symbol'), filters = 'go', values = cell_population_proliferation_go, mart = mouse)
+cell_population_proliferation_go_list <- list(genes.cell_population_proliferation$mgi_symbol)
+epc.combined <- AddModuleScore(epc.combined, features = cell_population_proliferation_go_list, name = "Cell_population_proliferation_GO")
+
+```
+
+
+```{r plotGO_pseudotime_smooth, fig.height = 1.75, fig.width = 5}
+
+ggplot(epc.combined@meta.data, aes(x = ep_pseudo, y = Cell_differentiation_NEG_GO1)) + stat_smooth(geom = 'smooth', level = 0.99,  color = 'red', fill = 'pink', alpha = 0.5) + theme_cowplot()
+
+ggplot(epc.combined@meta.data, aes(x = ep_pseudo, y = Cell_migration_GO1)) + stat_smooth(geom = 'smooth', level = 0.99,  color = 'red', fill = 'pink', alpha = 0.5) + theme_cowplot()
+
+ggplot(epc.combined@meta.data, aes(x = ep_pseudo, y = Cell_population_proliferation_GO1)) + stat_smooth(geom = 'smooth', level = 0.99, color = 'red', fill = 'pink', alpha = 0.5) + theme_cowplot()
+
+ggplot(epc.combined@meta.data, aes(x = ep_pseudo, y = SR)) + stat_smooth(geom = 'smooth', level = 0.99, color = 'red', fill = 'pink', alpha = 0.5) + theme_cowplot()
+ggplot(epc.combined@meta.data, aes(x = ep_pseudo, y = nFeature_RNA)) + stat_smooth(geom = 'smooth', level = 0.99, color = 'red', fill = 'pink', alpha = 0.5) + theme_cowplot()
+```
+
+Load regular e-cell object 
+```{r regularObject}
+# Reload the regular Seurat object (just to not mix up what's what in my environment)
+load("Troy_UI_Inj_after_analysis_pipe_TOM_regTom_2021_07_10.Robj")
+```
+
+## Load Monocle3 seurat object with perivasc cells
+For some last graphs needed to show expression profile of recombined perivasc cells
+
+```{r Monocle3Seurat}
+# Load monocle 3 Seurat object
+load("../perivascular.pseudo_2107.Robj")
+```
